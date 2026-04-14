@@ -1,0 +1,15 @@
+{
+  "name": "imgs-to-pdf",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.6.3",
+    "cheerio": "^1.0.0-rc.12",
+    "puppeteer": "^24.0.0",
+    "rimraf": "^5.0.5",
+    "sharp": "^0.33.5"
+  }
+}
