@@ -3,6 +3,5 @@ cache/
 images/
 xtc/
 pdfs/
-package-lock.json
 .DS_Store
 *.txt
