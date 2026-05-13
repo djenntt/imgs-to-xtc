@@ -427,7 +427,7 @@ Usage: node index.js <name> [format] [cssSelector] [options]
 
 Arguments:
   name          Base name for output files (default: 'output')
-                Also checks for <name>.txt for URLs (e.g. 'berserk' reads berserk.txt, falls back to urls.txt)
+                Also checks for <name>.txt for URLs (e.g. 'my-content' reads my-content.txt, falls back to urls.txt)
   format        Output format: 'pdf', 'pdfclean', 'xtc', 'xtcclean', 'xtcpaged', or 'xtcpagedclean' (default: 'pdf')
   cssSelector   CSS selector for images on the page (default: 'img')
 
@@ -456,10 +456,10 @@ Examples:
   TITLE="My Book" AUTHOR="Author" node index.js book xtc
   node index.js manga xtc 'img' --no-cache
 
-Paged mode (one URL = one image, e.g. readcomicsonline-style sites):
-  node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
-  IMG_LIMIT=50 node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
-  Outputs: invincible-vol-1-01.xtc, invincible-vol-1-02.xtc, ... in ./xtc/invincible-vol-1/
+Paged mode (one URL = one image):
+  node index.js my-content xtcpaged 'img.page-image'
+  IMG_LIMIT=50 node index.js my-content xtcpaged 'img.page-image'
+  Outputs: my-content-01.xtc, my-content-02.xtc, ... in ./xtc/my-content/
 `);
 }
 
@@ -607,8 +607,8 @@ Paged mode (one URL = one image, e.g. readcomicsonline-style sites):
     }
 
     /**
-     * Paged mode: each URL is a single comic page (one image per URL).
-     * Downloads all pages, then splits into IMG_LIMIT-sized XTC files.
+     * Paged mode: each URL contains a single image.
+     * Downloads all pages in order, then splits into IMG_LIMIT-sized XTC files.
      */
     async function getPagedImagePath(url) {
         const urlHash = crypto.createHash('md5').update(url).digest('hex').slice(0, 12);

@@ -9,7 +9,7 @@ A Node.js tool for batch-downloading images from web pages and converting them i
 - XTC output supports 1-bit monochrome (XTG) or 2-bit grayscale with 4 levels (XTH)
 - Multiple dithering algorithms: Sierra-Lite, Floyd-Steinberg, Atkinson, Ordered, or none
 - Portrait images are automatically split into segments and rotated 90° CW for landscape reading on e-ink displays
-- **Paged mode** for sites where each URL is a single image (e.g. readcomicsonline) — accumulates all pages and splits output into multiple XTC files at a configurable limit
+- **Paged mode** for sites where each URL contains a single image — accumulates all pages and splits output into multiple XTC files at a configurable limit
 - URL-based image caching so re-runs skip already-downloaded pages
 - Output file detection so already-converted entries are skipped entirely
 - Smart retry system with a failed queue that retries between successful downloads
@@ -53,7 +53,7 @@ node index.js <name> [format] [cssSelector] [options]
     - `pdfclean` - Convert to PDF, then delete cached images
     - `xtc` - Convert to XTC for e-readers
     - `xtcclean` - Convert to XTC, then delete cached images
-    - `xtcpaged` - Paged mode: each URL is one image (e.g. readcomicsonline-style sites). Splits output into multiple XTC files by `IMG_LIMIT`.
+    - `xtcpaged` - Paged mode: each URL contains a single image. Accumulates all images and splits output into multiple XTC files by `IMG_LIMIT`.
     - `xtcpagedclean` - Same as `xtcpaged`, then delete cached images
 - `cssSelector` - CSS selector to target images on the page (default: `img`)
 
@@ -102,15 +102,14 @@ node index.js my-content xtc 'img' --no-cache
 # Add metadata
 TITLE="My Publication" AUTHOR="Author Name" node index.js my-content xtc 'img.page-image'
 
-# Paged mode — one URL per image (e.g. readcomicsonline-style sites)
-# Each URL in the txt file is a separate page; outputs split into 100-image XTC files
-node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
+# Paged mode — one URL per image, outputs split into 100-image XTC files by default
+node index.js my-content xtcpaged 'img.page-image'
 
 # Paged mode with custom limit (50 images per file)
-IMG_LIMIT=50 node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
+IMG_LIMIT=50 node index.js my-content xtcpaged 'img.page-image'
 
 # Paged mode, single output file (no split)
-IMG_LIMIT=0 node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
+IMG_LIMIT=0 node index.js my-content xtcpaged 'img.page-image'
 ```
 
 ## URL Files
