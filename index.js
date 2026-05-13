@@ -353,6 +353,56 @@ async function convertImagesToXtc(imagesFolderPath, outputPath, options = {}) {
 }
 
 /**
+ * Convert an ordered list of absolute image file paths to a single XTC file.
+ * Used by paged mode (one URL = one image); leaves the original convertImagesToXtc untouched.
+ */
+async function convertImagePathsToXtc(imagePaths, outputPath, options = {}) {
+    const dithering = options.dithering || 'sierra-lite';
+    const is2bit = options.is2bit !== false;
+    const contrast = options.contrast || 0;
+    const device = options.device || 'X4';
+    const splitMode = options.splitMode || 'halves';
+    const title = options.title || '';
+    const author = options.author || '';
+
+    if (imagePaths.length === 0) throw new Error('No image paths provided');
+
+    console.log(`Processing ${imagePaths.length} pages (${is2bit ? '2-bit' : '1-bit'}, dithering: ${dithering}, split: ${splitMode})...`);
+
+    const pageBuffers = [];
+
+    for (let i = 0; i < imagePaths.length; i++) {
+        const processedPages = await loadAndProcessImage(imagePaths[i], {
+            device,
+            contrast,
+            splitMode,
+            padding: options.padding != null ? options.padding : 0
+        });
+
+        const splitInfo = processedPages.length > 1 ? ` -> ${processedPages.length} pages` : '';
+        console.log(`  [${i + 1}/${imagePaths.length}] ${path.basename(imagePaths[i])}${splitInfo}`);
+
+        for (const { pixels, width, height } of processedPages) {
+            applyDithering(pixels, width, height, dithering, is2bit);
+            const pageBuffer = is2bit
+                ? pixelsToXth(pixels, width, height)
+                : pixelsToXtg(pixels, width, height);
+            pageBuffers.push(pageBuffer);
+        }
+    }
+
+    const metadata = (title || author) ? {
+        title: title || undefined,
+        author: author || undefined,
+        toc: []
+    } : undefined;
+
+    const xtcBuffer = buildXtc(pageBuffers, { is2bit, metadata });
+    fs.writeFileSync(outputPath, xtcBuffer);
+    console.log(`XTC file created: ${outputPath} (${(xtcBuffer.length / 1024).toFixed(1)} KB, ${pageBuffers.length} pages from ${imagePaths.length} images)`);
+}
+
+/**
  * Convert images to PDF using ImageMagick (original behavior)
  */
 function convertImagesToPdf(imagesFolderPath, pdfPath) {
@@ -378,7 +428,7 @@ Usage: node index.js <name> [format] [cssSelector] [options]
 Arguments:
   name          Base name for output files (default: 'output')
                 Also checks for <name>.txt for URLs (e.g. 'berserk' reads berserk.txt, falls back to urls.txt)
-  format        Output format: 'pdf', 'pdfclean', 'xtc', or 'xtcclean' (default: 'pdf')
+  format        Output format: 'pdf', 'pdfclean', 'xtc', 'xtcclean', 'xtcpaged', or 'xtcpagedclean' (default: 'pdf')
   cssSelector   CSS selector for images on the page (default: 'img')
 
 XTC Options (set via environment variables):
@@ -388,7 +438,8 @@ XTC Options (set via environment variables):
   CONTRAST      Contrast level 0-3 (default: 0 = off)
   DEVICE        Target device: X4 or X3 (default: X4)
   PADDING       Bezel padding in pixels per side (default: 0)
-  RETRIES       Max attempts per chapter before giving up (default: 3)
+  RETRIES       Max attempts per page/chapter before giving up (default: 3)
+  IMG_LIMIT     Max images per XTC file in paged mode — output split as name-01.xtc etc. (default: 100, 0 = single file)
   TITLE         Book title for XTC metadata
   AUTHOR        Book author for XTC metadata
 
@@ -404,6 +455,11 @@ Examples:
   DITHERING=atkinson SPLIT=none node index.js manga xtc 'img'
   TITLE="My Book" AUTHOR="Author" node index.js book xtc
   node index.js manga xtc 'img' --no-cache
+
+Paged mode (one URL = one image, e.g. readcomicsonline-style sites):
+  node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
+  IMG_LIMIT=50 node index.js invincible-vol-1 xtcpaged 'img.img-responsive.scan-page'
+  Outputs: invincible-vol-1-01.xtc, invincible-vol-1-02.xtc, ... in ./xtc/invincible-vol-1/
 `);
 }
 
@@ -419,8 +475,9 @@ Examples:
     const format = process.argv[3] || 'pdf';
     const cssSelector = process.argv[4] || 'img';
 
+    const isPagedMode = format === 'xtcpaged' || format === 'xtcpagedclean';
     const isXtc = format === 'xtc' || format === 'xtcclean';
-    const shouldClean = format === 'pdfclean' || format === 'xtcclean';
+    const shouldClean = format === 'pdfclean' || format === 'xtcclean' || format === 'xtcpagedclean';
     const outputExt = isXtc ? '.xtc' : '.pdf';
 
     const noCache = process.argv.includes('--no-cache');
@@ -442,8 +499,9 @@ Examples:
         author: process.env.AUTHOR || ''
     };
 
-    console.log(`Output format: ${isXtc ? 'XTC' : 'PDF'}`);
-    if (isXtc) {
+    const formatLabel = isPagedMode ? 'XTC (paged)' : isXtc ? 'XTC' : 'PDF';
+    console.log(`Output format: ${formatLabel}`);
+    if (isXtc || isPagedMode) {
         console.log(`  Device: ${xtcOptions.device}, Dithering: ${xtcOptions.dithering}, Split: ${xtcOptions.splitMode}, 2-bit: ${xtcOptions.is2bit}`);
     }
 
@@ -546,6 +604,121 @@ Examples:
         }
 
         return true;
+    }
+
+    /**
+     * Paged mode: each URL is a single comic page (one image per URL).
+     * Downloads all pages, then splits into IMG_LIMIT-sized XTC files.
+     */
+    async function getPagedImagePath(url) {
+        const urlHash = crypto.createHash('md5').update(url).digest('hex').slice(0, 12);
+        const imagesFolderPath = path.join(cacheDir, urlHash);
+        const metaPath = path.join(imagesFolderPath, '.meta.json');
+
+        if (!noCache && fs.existsSync(metaPath)) {
+            const imageFiles = fs.readdirSync(imagesFolderPath)
+                .filter(f => /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f))
+                .sort((a, b) => {
+                    const numA = parseInt(a.match(/\d+/)?.[0] || '0', 10);
+                    const numB = parseInt(b.match(/\d+/)?.[0] || '0', 10);
+                    return numA - numB;
+                });
+            if (imageFiles.length > 0) return path.join(imagesFolderPath, imageFiles[0]);
+            rimraf.sync(imagesFolderPath);
+        }
+
+        if (noCache && fs.existsSync(imagesFolderPath)) rimraf.sync(imagesFolderPath);
+        if (!fs.existsSync(imagesFolderPath)) fs.mkdirSync(imagesFolderPath, { recursive: true });
+
+        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors);
+        if (!ok) return null;
+
+        const imageFiles = fs.readdirSync(imagesFolderPath)
+            .filter(f => /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f))
+            .sort((a, b) => {
+                const numA = parseInt(a.match(/\d+/)?.[0] || '0', 10);
+                const numB = parseInt(b.match(/\d+/)?.[0] || '0', 10);
+                return numA - numB;
+            });
+        return imageFiles.length > 0 ? path.join(imagesFolderPath, imageFiles[0]) : null;
+    }
+
+    async function processPagedMode() {
+        const imgLimit = parseInt(process.env.IMG_LIMIT || '100', 10);
+        const allImagePaths = new Array(urls.length).fill(null);
+
+        // Download phase
+        for (let i = 0; i < urls.length; i++) {
+            const url = urls[i];
+            const seq = formatSequenceNumber(i + 1, urls.length);
+            console.log(`\n[${seq}/${urls.length}] Fetching: ${url}`);
+
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                    const imgPath = await getPagedImagePath(url);
+                    if (imgPath) { allImagePaths[i] = imgPath; break; }
+                } catch (err) {
+                    console.error(`  [${seq}] ERROR: ${err.message}`);
+                }
+                if (attempt < MAX_RETRIES) {
+                    console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
+                } else {
+                    console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts, skipping.`);
+                }
+            }
+        }
+
+        const successPaths = allImagePaths.filter(Boolean);
+        const failedCount = urls.length - successPaths.length;
+        console.log(`\nDownloaded ${successPaths.length}/${urls.length} pages${failedCount > 0 ? ` (${failedCount} failed)` : ''}.`);
+
+        if (successPaths.length === 0) {
+            console.error('No pages downloaded, nothing to convert.');
+            return;
+        }
+
+        // Chunk and convert
+        const effectiveLimit = imgLimit > 0 ? imgLimit : successPaths.length;
+        const chunks = [];
+        for (let i = 0; i < successPaths.length; i += effectiveLimit) {
+            chunks.push(successPaths.slice(i, i + effectiveLimit));
+        }
+
+        const outputFolderPath = path.join('./xtc', baseName);
+        if (!fs.existsSync(outputFolderPath)) fs.mkdirSync(outputFolderPath, { recursive: true });
+
+        const suffixWidth = Math.max(chunks.length.toString().length, 2);
+        console.log(`\nConverting into ${chunks.length} XTC file(s) (limit: ${effectiveLimit} pages each)...`);
+
+        for (let c = 0; c < chunks.length; c++) {
+            const suffix = chunks.length > 1 ? `-${String(c + 1).padStart(suffixWidth, '0')}` : '';
+            const outputPath = path.join(outputFolderPath, `${baseName}${suffix}.xtc`);
+
+            console.log(`\n[${c + 1}/${chunks.length}] ${outputPath} (${chunks[c].length} pages)`);
+
+            if (fs.existsSync(outputPath)) {
+                console.log(`  Already exists, skipping.`);
+                continue;
+            }
+
+            await convertImagePathsToXtc(chunks[c], outputPath, {
+                ...xtcOptions,
+                title: xtcOptions.title || baseName
+            });
+
+            if (shouldClean) {
+                for (const imgPath of chunks[c]) rimraf.sync(path.dirname(imgPath));
+            }
+        }
+
+        console.log(`\n========================================`);
+        console.log(`Done! ${chunks.length} XTC file(s) in ./xtc/${baseName}/`);
+        if (failedCount > 0) console.log(`${failedCount} pages failed to download — re-run to retry (cached pages skipped).`);
+    }
+
+    if (isPagedMode) {
+        await processPagedMode();
+        return;
     }
 
     const failedQueue = []; // chapter indices that failed
