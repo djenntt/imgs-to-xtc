@@ -652,55 +652,96 @@ Paged mode (one URL = one image):
     async function processPagedMode() {
         const imgLimit = parseInt(process.env.IMG_LIMIT || '100', 10);
         const allImagePaths = new Array(urls.length).fill(null);
+        const failedQueue = [];
 
         const browser = await puppeteer.launch({
             headless: 'new',
             args: ['--disable-blink-features=AutomationControlled', '--no-sandbox']
         });
 
-        // Download phase — reuse one browser across all pages
+        async function tryPageWithRetries(index) {
+            const seq = formatSequenceNumber(index + 1, urls.length);
+            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                try {
+                    const imgPath = await getPagedImagePath(urls[index], browser);
+                    if (imgPath) { allImagePaths[index] = imgPath; return true; }
+                } catch (err) {
+                    console.error(`  [${seq}] ERROR: ${err.message}`);
+                }
+                if (attempt < MAX_RETRIES) {
+                    console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
+                } else {
+                    console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts.`);
+                }
+            }
+            return false;
+        }
+
+        async function drainPagedFailedQueue() {
+            if (failedQueue.length === 0) return;
+            console.log(`\n  >> Processing failed queue (${failedQueue.length} pages)...`);
+            const stillFailed = [];
+            for (const index of failedQueue) {
+                const seq = formatSequenceNumber(index + 1, urls.length);
+                console.log(`\n  >> Retrying page ${seq}`);
+                const success = await tryPageWithRetries(index);
+                if (success) {
+                    console.log(`  >> Page ${seq} recovered!`);
+                } else {
+                    stillFailed.push(index);
+                    console.log(`  >> Page ${seq} still failing.`);
+                }
+                await new Promise(r => setTimeout(r, 300));
+            }
+            failedQueue.length = 0;
+            failedQueue.push(...stillFailed);
+            if (failedQueue.length > 0) {
+                console.log(`\n  >> ${failedQueue.length} pages still in failed queue.`);
+            } else {
+                console.log(`\n  >> Failed queue cleared!`);
+            }
+        }
+
+        // Download phase — reuse one browser, drain failed queue after each success
         try {
             for (let i = 0; i < urls.length; i++) {
-                const url = urls[i];
                 const seq = formatSequenceNumber(i + 1, urls.length);
-                console.log(`\n[${seq}/${urls.length}] Fetching: ${url}`);
+                console.log(`\n[${seq}/${urls.length}] Fetching: ${urls[i]}`);
 
-                for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                    try {
-                        const imgPath = await getPagedImagePath(url, browser);
-                        if (imgPath) { allImagePaths[i] = imgPath; break; }
-                    } catch (err) {
-                        console.error(`  [${seq}] ERROR: ${err.message}`);
-                    }
-                    if (attempt < MAX_RETRIES) {
-                        console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
-                    } else {
-                        console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts, skipping.`);
-                    }
-                }
-
-                // Brief pause between pages to avoid overwhelming the system
+                const success = await tryPageWithRetries(i);
                 await new Promise(r => setTimeout(r, 300));
+
+                if (success) {
+                    await drainPagedFailedQueue();
+                } else {
+                    failedQueue.push(i);
+                    console.log(`  Queued page ${seq} for later (${failedQueue.length} in failed queue)`);
+                }
+            }
+
+            // Final drain
+            if (failedQueue.length > 0) {
+                console.log(`\n========================================`);
+                console.log(`All pages attempted. Final retry of ${failedQueue.length} failed pages...`);
+                await drainPagedFailedQueue();
             }
         } finally {
             await browser.close();
         }
 
-        const successPaths = allImagePaths.filter(Boolean);
-        const failedCount = urls.length - successPaths.length;
-        console.log(`\nDownloaded ${successPaths.length}/${urls.length} pages${failedCount > 0 ? ` (${failedCount} failed)` : ''}.`);
+        const failedCount = failedQueue.length;
+        const downloadedCount = allImagePaths.filter(Boolean).length;
+        console.log(`\nDownloaded ${downloadedCount}/${urls.length} pages.`);
 
         if (failedCount > 0) {
-            const missingPages = allImagePaths
-                .map((p, i) => p ? null : i + 1)
-                .filter(Boolean);
+            const missingPages = failedQueue.map(i => i + 1);
             console.error(`\nFAILED: ${failedCount} page(s) could not be downloaded. No XTC files will be created.`);
             console.error(`  Missing pages: ${missingPages.join(', ')}`);
             console.error(`  Re-run the same command to retry — already-cached pages will be skipped.`);
             return;
         }
 
-        if (successPaths.length === 0) {
+        if (downloadedCount === 0) {
             console.error('No pages downloaded, nothing to convert.');
             return;
         }
