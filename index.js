@@ -205,6 +205,12 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
             await new Promise(r => setTimeout(r, 500));
         }
 
+        try {
+            await page.waitForSelector(cssSelector, { timeout: 10000 });
+        } catch {
+            console.log(`  Warning: selector "${cssSelector}" not found after 10s, querying anyway`);
+        }
+
         const imageUrls = await page.evaluate((selector) => {
             const images = Array.from(document.querySelectorAll(selector));
             return images.map(img => img.getAttribute('data-src') || img.src).filter(src => src && src !== 'about:blank');
@@ -580,7 +586,13 @@ Paged mode (one URL = one image):
             if (!fs.existsSync(imagesFolderPath)) {
                 fs.mkdirSync(imagesFolderPath, { recursive: true });
             }
-            const downloadOk = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors);
+            const downloadOk = await withTimeout(
+                downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, null, {
+                    waitUntil: 'load',
+                    blockResources: true
+                }),
+                120000
+            );
             if (!downloadOk) return false;
         }
 
