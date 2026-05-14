@@ -11,13 +11,21 @@ const { pixelsToXtg, pixelsToXth } = require('./src/xtg');
 const { buildXtc } = require('./src/xtc');
 const { loadAndProcessImage } = require('./src/image-processing');
 
+function withTimeout(promise, ms) {
+    let timeoutId;
+    const timeout = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
+}
+
 /**
  * Download an image using the browser's fetch (keeps cookies/referer intact).
  * Falls back to navigating directly to the image URL if fetch fails.
  */
 async function downloadImageViaBrowser(page, imageUrl, savePath) {
     // Try 1: fetch with Referer header (works for most CDNs)
-    const result = await page.evaluate(async (url) => {
+    const result = await withTimeout(page.evaluate(async (url) => {
         try {
             const resp = await fetch(url, {
                 headers: { 'Referer': document.location.href },
@@ -35,7 +43,7 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
         } catch (e) {
             return { error: e.message };
         }
-    }, imageUrl);
+    }, imageUrl), 20000);
 
     if (result.base64) {
         fs.writeFileSync(savePath, Buffer.from(result.base64, 'base64'));
@@ -43,13 +51,11 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
     }
 
     // Try 2: extract from already-loaded <img> via canvas
-    const canvasResult = await page.evaluate(async (url) => {
-        // Find an img element whose src or data-src matches this URL
+    const canvasResult = await withTimeout(page.evaluate(async (url) => {
         const imgs = Array.from(document.querySelectorAll('img'));
         const img = imgs.find(i => {
             const src = i.src || '';
             const dataSrc = i.getAttribute('data-src') || '';
-            // Match by stripping query params for comparison
             const urlBase = url.split('?')[0];
             return src.split('?')[0] === urlBase || dataSrc.split('?')[0] === urlBase;
         });
@@ -67,7 +73,7 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
         } catch (e) {
             return { error: e.message };
         }
-    }, imageUrl);
+    }, imageUrl), 10000);
 
     if (canvasResult.base64) {
         fs.writeFileSync(savePath, Buffer.from(canvasResult.base64, 'base64'));
@@ -79,7 +85,10 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
     const imgPage = await browser.newPage();
     try {
         await imgPage.setExtraHTTPHeaders({ 'Referer': page.url() });
-        const response = await imgPage.goto(imageUrl, { waitUntil: 'load', timeout: 30000 });
+        const response = await withTimeout(
+            imgPage.goto(imageUrl, { waitUntil: 'load', timeout: 30000 }),
+            30000
+        );
         if (!response || !response.ok()) {
             throw new Error(`HTTP ${response ? response.status() : 'no response'}`);
         }
@@ -110,170 +119,187 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
         ]
     });
     const page = await browser.newPage();
-
-    // Mask headless detection
-    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-    await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    });
-
-    // Set up CDP to intercept image responses as they load
     const client = await page.createCDPSession();
-    await client.send('Network.enable');
-    const capturedImages = new Map(); // url (without query) -> { requestId, url }
-
-    client.on('Network.responseReceived', (event) => {
-        const { requestId, response } = event;
-        const mimeType = response.mimeType || '';
-        if (mimeType.startsWith('image/')) {
-            const urlBase = response.url.split('?')[0];
-            capturedImages.set(urlBase, { requestId, url: response.url });
-        }
-    });
-
-    // Navigate to the URL, retrying if we get redirected to an ad/popup
-    const targetDomain = new URL(url).hostname;
-    const MAX_NAV_ATTEMPTS = 10;
-
-    for (let navAttempt = 1; navAttempt <= MAX_NAV_ATTEMPTS; navAttempt++) {
-        await page.goto(url, { waitUntil, timeout: navTimeout });
-
-        const currentHostname = (() => { try { return new URL(page.url()).hostname; } catch { return ''; } })();
-
-        if (currentHostname === targetDomain) break;
-
-        if (navAttempt < MAX_NAV_ATTEMPTS) {
-            console.log(`  Redirected to ${currentHostname}, retrying navigation... (${navAttempt}/${MAX_NAV_ATTEMPTS})`);
-        } else {
-            console.error(`  Could not reach ${targetDomain} after ${MAX_NAV_ATTEMPTS} attempts, stuck on ${currentHostname}`);
-        }
-    }
-
-    // Debug: log what the page actually looks like
-    const pageTitle = await page.title();
-    const imgCount = await page.evaluate((sel) => document.querySelectorAll(sel).length, cssSelector);
-    const allImgCount = await page.evaluate(() => document.querySelectorAll('img').length);
-    console.log(`  Page title: "${pageTitle}"`);
-    console.log(`  Total <img> on page: ${allImgCount}, matching selector: ${imgCount}`);
-    if (imgCount === 0) {
-        const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 500));
-        console.log(`  Page text preview: ${bodyText.slice(0, 200)}`);
-    }
-
-    // Quick scroll to trigger lazy images
-    await page.evaluate(async () => {
-        await new Promise((resolve) => {
-            let totalHeight = 0;
-            const distance = 500;
-            const timer = setInterval(() => {
-                window.scrollBy(0, distance);
-                totalHeight += distance;
-                if (totalHeight >= document.body.scrollHeight) {
-                    clearInterval(timer);
-                    resolve();
-                }
-            }, 100);
-        });
-    });
-    await new Promise(r => setTimeout(r, 2000));
-
-    const imageUrls = await page.evaluate((selector) => {
-        const images = Array.from(document.querySelectorAll(selector));
-        return images.map(img => img.getAttribute('data-src') || img.src).filter(src => src && src !== 'about:blank');
-    }, cssSelector);
-
-    console.log(`  Found ${imageUrls.length} images`);
-
-    let downloadedCount = 0;
     let failed = false;
-    const failedIndices = []; // track which images failed the fast method
 
-    // === PASS 1: Fast fetch method ===
-    for (let j = 0; j < imageUrls.length; j++) {
-        const imageUrl = imageUrls[j];
-        const ext = path.extname(new URL(imageUrl).pathname) || '.jpg';
-        const fileName = `${String(j + 1).padStart(4, '0')}${ext}`;
-        const savePath = path.join(imagesFolderPath, fileName);
+    try {
+        // Mask headless detection
+        await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        });
 
-        try {
-            await downloadImageViaBrowser(page, imageUrl, savePath);
-            downloadedCount++;
-            process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName}\r`);
-        } catch (fetchError) {
-            failedIndices.push(j);
+        // Block non-essential resources in paged mode to reduce load time and memory
+        if (pageOptions.blockResources) {
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const type = req.resourceType();
+                if (['stylesheet', 'font', 'media', 'ping', 'beacon', 'csp_violationreport'].includes(type)) {
+                    req.abort();
+                } else {
+                    req.continue();
+                }
+            });
         }
-    }
 
-    // === PASS 2: CDP fallback for anything that failed ===
-    if (failedIndices.length > 0) {
-        console.log(`\n  Fast method got ${downloadedCount}/${imageUrls.length}, using CDP fallback for ${failedIndices.length} remaining...`);
+        // Set up CDP network monitoring (skipped in paged mode)
+        const capturedImages = new Map();
+        if (!pageOptions.skipCdp) {
+            await client.send('Network.enable');
+            client.on('Network.responseReceived', (event) => {
+                const { requestId, response } = event;
+                const mimeType = response.mimeType || '';
+                if (mimeType.startsWith('image/')) {
+                    const urlBase = response.url.split('?')[0];
+                    capturedImages.set(urlBase, { requestId, url: response.url });
+                }
+            });
+        }
 
-        // Scroll to each failed image to ensure it loads, then wait for all to complete
-        await page.evaluate(async (selector) => {
-            const imgs = Array.from(document.querySelectorAll(selector));
-            for (const img of imgs) {
-                img.scrollIntoView({ behavior: 'instant', block: 'center' });
-                await new Promise(r => setTimeout(r, 150));
+        // Navigate to the URL, retrying if we get redirected to an ad/popup
+        const targetDomain = new URL(url).hostname;
+        const MAX_NAV_ATTEMPTS = 10;
+
+        for (let navAttempt = 1; navAttempt <= MAX_NAV_ATTEMPTS; navAttempt++) {
+            await page.goto(url, { waitUntil, timeout: navTimeout });
+
+            const currentHostname = (() => { try { return new URL(page.url()).hostname; } catch { return ''; } })();
+
+            if (currentHostname === targetDomain) break;
+
+            if (navAttempt < MAX_NAV_ATTEMPTS) {
+                console.log(`  Redirected to ${currentHostname}, retrying navigation... (${navAttempt}/${MAX_NAV_ATTEMPTS})`);
+            } else {
+                console.error(`  Could not reach ${targetDomain} after ${MAX_NAV_ATTEMPTS} attempts, stuck on ${currentHostname}`);
             }
+        }
+
+        // Debug: log what the page actually looks like
+        const pageTitle = await page.title();
+        const imgCount = await page.evaluate((sel) => document.querySelectorAll(sel).length, cssSelector);
+        const allImgCount = await page.evaluate(() => document.querySelectorAll('img').length);
+        console.log(`  Page title: "${pageTitle}"`);
+        console.log(`  Total <img> on page: ${allImgCount}, matching selector: ${imgCount}`);
+        if (imgCount === 0) {
+            const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 500));
+            console.log(`  Page text preview: ${bodyText.slice(0, 200)}`);
+        }
+
+        if (!pageOptions.skipScroll) {
+            await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 500;
+                    const timer = setInterval(() => {
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        if (totalHeight >= document.body.scrollHeight) {
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 100);
+                });
+            });
+            await new Promise(r => setTimeout(r, 2000));
+        } else {
+            await new Promise(r => setTimeout(r, 500));
+        }
+
+        const imageUrls = await page.evaluate((selector) => {
+            const images = Array.from(document.querySelectorAll(selector));
+            return images.map(img => img.getAttribute('data-src') || img.src).filter(src => src && src !== 'about:blank');
         }, cssSelector);
 
-        // Wait for all images to report loaded
-        await page.evaluate(async (selector) => {
-            const imgs = Array.from(document.querySelectorAll(selector));
-            const start = Date.now();
-            while (Date.now() - start < 15000) {
-                if (imgs.every(img => img.complete && img.naturalWidth > 0)) break;
-                await new Promise(r => setTimeout(r, 500));
-            }
-        }, cssSelector);
+        console.log(`  Found ${imageUrls.length} images`);
 
-        // Give CDP a moment to capture the last responses
-        await new Promise(r => setTimeout(r, 1000));
+        let downloadedCount = 0;
+        const failedIndices = [];
 
-        for (const j of failedIndices) {
+        // === PASS 1: Fast fetch method ===
+        for (let j = 0; j < imageUrls.length; j++) {
             const imageUrl = imageUrls[j];
             const ext = path.extname(new URL(imageUrl).pathname) || '.jpg';
             const fileName = `${String(j + 1).padStart(4, '0')}${ext}`;
             const savePath = path.join(imagesFolderPath, fileName);
-            const urlBase = imageUrl.split('?')[0];
-            const captured = capturedImages.get(urlBase);
 
-            if (captured) {
-                try {
-                    const { body, base64Encoded } = await client.send('Network.getResponseBody', {
-                        requestId: captured.requestId
-                    });
-                    const buffer = base64Encoded
-                        ? Buffer.from(body, 'base64')
-                        : Buffer.from(body);
-                    fs.writeFileSync(savePath, buffer);
-                    downloadedCount++;
-                    process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName} (CDP)\r`);
-                } catch (cdpError) {
-                    failed = true;
-                    errors.push({ url: imageUrl, error: `cdp: ${cdpError.message}` });
-                    console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: ${cdpError.message}`);
-                }
-            } else {
-                failed = true;
-                errors.push({ url: imageUrl, error: 'not captured by CDP' });
-                console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: not captured by CDP`);
+            try {
+                await downloadImageViaBrowser(page, imageUrl, savePath);
+                downloadedCount++;
+                process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName}\r`);
+            } catch (fetchError) {
+                failedIndices.push(j);
             }
         }
-    }
-    console.log(`  Downloaded ${downloadedCount}/${imageUrls.length} images`);
 
-    await client.detach().catch(() => {});
-    await page.close();
-    if (!sharedBrowser) await browser.close();
+        // === PASS 2: CDP fallback for anything that failed ===
+        if (failedIndices.length > 0) {
+            console.log(`\n  Fast method got ${downloadedCount}/${imageUrls.length}, using CDP fallback for ${failedIndices.length} remaining...`);
 
-    // Save cache metadata
-    if (!failed) {
-        fs.writeFileSync(metaPath, JSON.stringify({
-            url,
-            imageCount: imageUrls.length,
-            cachedAt: new Date().toISOString()
-        }, null, 2));
+            await page.evaluate(async (selector) => {
+                const imgs = Array.from(document.querySelectorAll(selector));
+                for (const img of imgs) {
+                    img.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    await new Promise(r => setTimeout(r, 150));
+                }
+            }, cssSelector);
+
+            await page.evaluate(async (selector) => {
+                const imgs = Array.from(document.querySelectorAll(selector));
+                const start = Date.now();
+                while (Date.now() - start < 15000) {
+                    if (imgs.every(img => img.complete && img.naturalWidth > 0)) break;
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }, cssSelector);
+
+            await new Promise(r => setTimeout(r, 1000));
+
+            for (const j of failedIndices) {
+                const imageUrl = imageUrls[j];
+                const ext = path.extname(new URL(imageUrl).pathname) || '.jpg';
+                const fileName = `${String(j + 1).padStart(4, '0')}${ext}`;
+                const savePath = path.join(imagesFolderPath, fileName);
+                const urlBase = imageUrl.split('?')[0];
+                const captured = capturedImages.get(urlBase);
+
+                if (captured) {
+                    try {
+                        const { body, base64Encoded } = await client.send('Network.getResponseBody', {
+                            requestId: captured.requestId
+                        });
+                        const buffer = base64Encoded
+                            ? Buffer.from(body, 'base64')
+                            : Buffer.from(body);
+                        fs.writeFileSync(savePath, buffer);
+                        downloadedCount++;
+                        process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName} (CDP)\r`);
+                    } catch (cdpError) {
+                        failed = true;
+                        errors.push({ url: imageUrl, error: `cdp: ${cdpError.message}` });
+                        console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: ${cdpError.message}`);
+                    }
+                } else {
+                    failed = true;
+                    errors.push({ url: imageUrl, error: 'not captured by CDP' });
+                    console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: not captured by CDP`);
+                }
+            }
+        }
+
+        console.log(`  Downloaded ${downloadedCount}/${imageUrls.length} images`);
+
+        // Save cache metadata
+        if (!failed) {
+            fs.writeFileSync(metaPath, JSON.stringify({
+                url,
+                imageCount: imageUrls.length,
+                cachedAt: new Date().toISOString()
+            }, null, 2));
+        }
+    } finally {
+        await client.detach().catch(() => {});
+        await page.close();
+        if (!sharedBrowser) await browser.close();
     }
 
     return !failed;
@@ -443,6 +469,7 @@ XTC Options (set via environment variables):
   PADDING       Bezel padding in pixels per side (default: 0)
   RETRIES       Max attempts per page/chapter before giving up (default: 3)
   IMG_LIMIT     Max images per XTC file in paged mode — output split as name-01.xtc etc. (default: 100, 0 = single file)
+  CONCURRENCY   Number of pages to fetch simultaneously in paged mode (default: 3)
   TITLE         Book title for XTC metadata
   AUTHOR        Book author for XTC metadata
 
@@ -635,7 +662,10 @@ Paged mode (one URL = one image):
 
         const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser, {
             waitUntil: 'load',
-            navTimeout: 30000
+            navTimeout: 30000,
+            skipScroll: true,
+            skipCdp: true,
+            blockResources: true
         });
         if (!ok) return null;
 
@@ -651,13 +681,23 @@ Paged mode (one URL = one image):
 
     async function processPagedMode() {
         const imgLimit = parseInt(process.env.IMG_LIMIT || '100', 10);
+        const CONCURRENCY = parseInt(process.env.CONCURRENCY || '3', 10);
+        const BROWSER_RESTART_EVERY = 150;
         const allImagePaths = new Array(urls.length).fill(null);
         const failedQueue = [];
 
-        const browser = await puppeteer.launch({
+        let browser = await puppeteer.launch({
             headless: 'new',
             args: ['--disable-blink-features=AutomationControlled', '--no-sandbox']
         });
+
+        async function restartBrowser() {
+            await browser.close();
+            browser = await puppeteer.launch({
+                headless: 'new',
+                args: ['--disable-blink-features=AutomationControlled', '--no-sandbox']
+            });
+        }
 
         async function tryPageWithRetries(index) {
             const seq = formatSequenceNumber(index + 1, urls.length);
@@ -702,21 +742,30 @@ Paged mode (one URL = one image):
             }
         }
 
-        // Download phase — reuse one browser, drain failed queue after each success
+        // Download phase — concurrent batches, drain failed queue between batches
         try {
-            for (let i = 0; i < urls.length; i++) {
-                const seq = formatSequenceNumber(i + 1, urls.length);
-                console.log(`\n[${seq}/${urls.length}] Fetching: ${urls[i]}`);
-
-                const success = await tryPageWithRetries(i);
-                await new Promise(r => setTimeout(r, 300));
-
-                if (success) {
-                    await drainPagedFailedQueue();
-                } else {
-                    failedQueue.push(i);
-                    console.log(`  Queued page ${seq} for later (${failedQueue.length} in failed queue)`);
+            for (let i = 0; i < urls.length; i += CONCURRENCY) {
+                if (i > 0 && i % BROWSER_RESTART_EVERY === 0) {
+                    console.log(`\n  Restarting browser to free memory (every ${BROWSER_RESTART_EVERY} pages)...`);
+                    await restartBrowser();
                 }
+
+                const batch = [];
+                for (let j = i; j < Math.min(i + CONCURRENCY, urls.length); j++) {
+                    const seq = formatSequenceNumber(j + 1, urls.length);
+                    console.log(`\n[${seq}/${urls.length}] Fetching: ${urls[j]}`);
+                    batch.push(
+                        tryPageWithRetries(j).then(success => {
+                            if (!success) {
+                                failedQueue.push(j);
+                                console.log(`  Queued page ${seq} for later (${failedQueue.length} in failed queue)`);
+                            }
+                        })
+                    );
+                }
+
+                await Promise.all(batch);
+                await drainPagedFailedQueue();
             }
 
             // Final drain
@@ -730,7 +779,8 @@ Paged mode (one URL = one image):
         }
 
         const failedCount = failedQueue.length;
-        const downloadedCount = allImagePaths.filter(Boolean).length;
+        const successPaths = allImagePaths.filter(Boolean);
+        const downloadedCount = successPaths.length;
         console.log(`\nDownloaded ${downloadedCount}/${urls.length} pages.`);
 
         if (failedCount > 0) {
