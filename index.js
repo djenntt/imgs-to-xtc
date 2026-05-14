@@ -11,6 +11,21 @@ const { pixelsToXtg, pixelsToXth } = require('./src/xtg');
 const { buildXtc } = require('./src/xtc');
 const { loadAndProcessImage } = require('./src/image-processing');
 
+const DOT_FRAMES = ['fetching   ', 'fetching.  ', 'fetching.. ', 'fetching...'];
+
+function redrawLines(lines) {
+    process.stdout.write(`\x1b[${lines.length}A`);
+    for (const line of lines) {
+        process.stdout.write('\r\x1b[K' + line + '\n');
+    }
+}
+
+function progressBar(current, total, width = 24) {
+    const pct = total > 0 ? current / total : 0;
+    const filled = Math.round(pct * width);
+    return `[${'▓'.repeat(filled)}${'░'.repeat(width - filled)}] ${current}/${total}`;
+}
+
 function withTimeout(promise, ms) {
     let timeoutId;
     const timeout = new Promise((_, reject) => {
@@ -121,6 +136,7 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
     const page = await browser.newPage();
     const client = await page.createCDPSession();
     let failed = false;
+    let downloadedCount = 0;
 
     try {
         // Mask headless detection
@@ -174,17 +190,6 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
             }
         }
 
-        // Debug: log what the page actually looks like
-        const pageTitle = await page.title();
-        const imgCount = await page.evaluate((sel) => document.querySelectorAll(sel).length, cssSelector);
-        const allImgCount = await page.evaluate(() => document.querySelectorAll('img').length);
-        console.log(`  Page title: "${pageTitle}"`);
-        console.log(`  Total <img> on page: ${allImgCount}, matching selector: ${imgCount}`);
-        if (imgCount === 0) {
-            const bodyText = await page.evaluate(() => document.body.innerText.slice(0, 500));
-            console.log(`  Page text preview: ${bodyText.slice(0, 200)}`);
-        }
-
         if (!pageOptions.skipScroll) {
             await page.evaluate(async () => {
                 await new Promise((resolve) => {
@@ -205,20 +210,13 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
             await new Promise(r => setTimeout(r, 500));
         }
 
-        try {
-            await page.waitForSelector(cssSelector, { timeout: 10000 });
-        } catch {
-            console.log(`  Warning: selector "${cssSelector}" not found after 10s, querying anyway`);
-        }
+        await page.waitForSelector(cssSelector, { timeout: 10000 }).catch(() => {});
 
         const imageUrls = await page.evaluate((selector) => {
             const images = Array.from(document.querySelectorAll(selector));
             return images.map(img => img.getAttribute('data-src') || img.src).filter(src => src && src !== 'about:blank');
         }, cssSelector);
 
-        console.log(`  Found ${imageUrls.length} images`);
-
-        let downloadedCount = 0;
         const failedIndices = [];
 
         // === PASS 1: Fast fetch method ===
@@ -227,11 +225,9 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
             const ext = path.extname(new URL(imageUrl).pathname) || '.jpg';
             const fileName = `${String(j + 1).padStart(4, '0')}${ext}`;
             const savePath = path.join(imagesFolderPath, fileName);
-
             try {
                 await downloadImageViaBrowser(page, imageUrl, savePath);
                 downloadedCount++;
-                process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName}\r`);
             } catch (fetchError) {
                 failedIndices.push(j);
             }
@@ -239,8 +235,6 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
 
         // === PASS 2: CDP fallback for anything that failed ===
         if (failedIndices.length > 0) {
-            console.log(`\n  Fast method got ${downloadedCount}/${imageUrls.length}, using CDP fallback for ${failedIndices.length} remaining...`);
-
             await page.evaluate(async (selector) => {
                 const imgs = Array.from(document.querySelectorAll(selector));
                 for (const img of imgs) {
@@ -270,29 +264,20 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
 
                 if (captured) {
                     try {
-                        const { body, base64Encoded } = await client.send('Network.getResponseBody', {
-                            requestId: captured.requestId
-                        });
-                        const buffer = base64Encoded
-                            ? Buffer.from(body, 'base64')
-                            : Buffer.from(body);
+                        const { body, base64Encoded } = await client.send('Network.getResponseBody', { requestId: captured.requestId });
+                        const buffer = base64Encoded ? Buffer.from(body, 'base64') : Buffer.from(body);
                         fs.writeFileSync(savePath, buffer);
                         downloadedCount++;
-                        process.stdout.write(`  Downloaded [${j + 1}/${imageUrls.length}] ${fileName} (CDP)\r`);
                     } catch (cdpError) {
                         failed = true;
                         errors.push({ url: imageUrl, error: `cdp: ${cdpError.message}` });
-                        console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: ${cdpError.message}`);
                     }
                 } else {
                     failed = true;
                     errors.push({ url: imageUrl, error: 'not captured by CDP' });
-                    console.error(`  Failed [${j + 1}/${imageUrls.length}] ${imageUrl}: not captured by CDP`);
                 }
             }
         }
-
-        console.log(`  Downloaded ${downloadedCount}/${imageUrls.length} images`);
 
         // Save cache metadata
         if (!failed) {
@@ -308,7 +293,7 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
         if (!sharedBrowser) await browser.close();
     }
 
-    return !failed;
+    return { success: !failed, downloaded: downloadedCount };
 }
 
 function formatSequenceNumber(number, totalUrls) {
@@ -341,50 +326,24 @@ async function convertImagesToXtc(imagesFolderPath, outputPath, options = {}) {
         throw new Error(`No image files found in ${imagesFolderPath}`);
     }
 
-    console.log(`Processing ${imageFiles.length} images for XTC (${is2bit ? '2-bit' : '1-bit'}, dithering: ${dithering}, split: ${splitMode})...`);
-
     const pageBuffers = [];
 
     for (let i = 0; i < imageFiles.length; i++) {
         const imagePath = path.join(imagesFolderPath, imageFiles[i]);
-
-        // loadAndProcessImage now returns an array of pages
-        // (portrait images get split into thirds, landscape just rotated)
         const processedPages = await loadAndProcessImage(imagePath, {
-            device,
-            contrast,
-            splitMode,
+            device, contrast, splitMode,
             padding: options.padding != null ? options.padding : 0
         });
-
-        const splitInfo = processedPages.length > 1 ? ` -> ${processedPages.length} pages` : '';
-        console.log(`  [${i + 1}/${imageFiles.length}] ${imageFiles[i]}${splitInfo}`);
-
         for (const { pixels, width, height } of processedPages) {
-            // Apply dithering
             applyDithering(pixels, width, height, dithering, is2bit);
-
-            // Encode to XTG or XTH
-            const pageBuffer = is2bit
-                ? pixelsToXth(pixels, width, height)
-                : pixelsToXtg(pixels, width, height);
-
-            pageBuffers.push(pageBuffer);
+            pageBuffers.push(is2bit ? pixelsToXth(pixels, width, height) : pixelsToXtg(pixels, width, height));
         }
     }
 
-    // Build metadata if provided
-    const metadata = (title || author) ? {
-        title: title || undefined,
-        author: author || undefined,
-        toc: []
-    } : undefined;
-
-    // Assemble XTC file
+    const metadata = (title || author) ? { title: title || undefined, author: author || undefined, toc: [] } : undefined;
     const xtcBuffer = buildXtc(pageBuffers, { is2bit, metadata });
-
     fs.writeFileSync(outputPath, xtcBuffer);
-    console.log(`XTC file created: ${outputPath} (${(xtcBuffer.length / 1024).toFixed(1)} KB, ${pageBuffers.length} pages from ${imageFiles.length} images)`);
+    return { pages: pageBuffers.length, sizeKb: xtcBuffer.length / 1024 };
 }
 
 /**
@@ -402,39 +361,23 @@ async function convertImagePathsToXtc(imagePaths, outputPath, options = {}) {
 
     if (imagePaths.length === 0) throw new Error('No image paths provided');
 
-    console.log(`Processing ${imagePaths.length} pages (${is2bit ? '2-bit' : '1-bit'}, dithering: ${dithering}, split: ${splitMode})...`);
-
     const pageBuffers = [];
-
     for (let i = 0; i < imagePaths.length; i++) {
         const processedPages = await loadAndProcessImage(imagePaths[i], {
-            device,
-            contrast,
-            splitMode,
+            device, contrast, splitMode,
             padding: options.padding != null ? options.padding : 0
         });
-
-        const splitInfo = processedPages.length > 1 ? ` -> ${processedPages.length} pages` : '';
-        console.log(`  [${i + 1}/${imagePaths.length}] ${path.basename(imagePaths[i])}${splitInfo}`);
-
+        process.stdout.write(`  ${progressBar(i + 1, imagePaths.length)}  encoding\r`);
         for (const { pixels, width, height } of processedPages) {
             applyDithering(pixels, width, height, dithering, is2bit);
-            const pageBuffer = is2bit
-                ? pixelsToXth(pixels, width, height)
-                : pixelsToXtg(pixels, width, height);
-            pageBuffers.push(pageBuffer);
+            pageBuffers.push(is2bit ? pixelsToXth(pixels, width, height) : pixelsToXtg(pixels, width, height));
         }
     }
 
-    const metadata = (title || author) ? {
-        title: title || undefined,
-        author: author || undefined,
-        toc: []
-    } : undefined;
-
+    const metadata = (title || author) ? { title: title || undefined, author: author || undefined, toc: [] } : undefined;
     const xtcBuffer = buildXtc(pageBuffers, { is2bit, metadata });
     fs.writeFileSync(outputPath, xtcBuffer);
-    console.log(`XTC file created: ${outputPath} (${(xtcBuffer.length / 1024).toFixed(1)} KB, ${pageBuffers.length} pages from ${imagePaths.length} images)`);
+    return { pages: pageBuffers.length, sizeKb: xtcBuffer.length / 1024 };
 }
 
 /**
@@ -569,34 +512,28 @@ Paged mode (one URL = one image):
                 .filter(f => /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f));
 
             if (cachedImages.length > 0 && cachedImages.length === meta.imageCount) {
-                console.log(`\n[${formattedSeq}/${urls.length}] Cache hit: ${url}`);
-                console.log(`  ${cachedImages.length} images in ./cache/${urlHash}/`);
                 cached = true;
             } else {
-                // Incomplete cache, clean it up so we can re-fetch
                 rimraf.sync(imagesFolderPath);
             }
         }
 
+        const label = `[${formattedSeq}/${urls.length}]`;
+
         if (!cached) {
-            if (noCache && fs.existsSync(imagesFolderPath)) {
-                rimraf.sync(imagesFolderPath);
-            }
-            console.log(`\n[${formattedSeq}/${urls.length}] Fetching: ${url}`);
-            if (!fs.existsSync(imagesFolderPath)) {
-                fs.mkdirSync(imagesFolderPath, { recursive: true });
-            }
-            const downloadOk = await withTimeout(
+            if (noCache && fs.existsSync(imagesFolderPath)) rimraf.sync(imagesFolderPath);
+            if (!fs.existsSync(imagesFolderPath)) fs.mkdirSync(imagesFolderPath, { recursive: true });
+
+            const dlResult = await withTimeout(
                 downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, null, {
                     waitUntil: 'load',
                     blockResources: true
                 }),
                 120000
             );
-            if (!downloadOk) return false;
+            if (!dlResult.success) return { success: false, line: null };
         }
 
-        // Extract chapter number from URL slug (e.g. "chapter-11.5" -> "011.5", "chapter-3" -> "003")
         const chapterMatch = url.match(/chapter[- ](\d+(?:\.\d+)?)\/?$/i);
         let chapterNum;
         if (chapterMatch) {
@@ -608,44 +545,28 @@ Paged mode (one URL = one image):
         }
         const outputName = `${baseName}_${chapterNum}`;
         const outputFolderPath = path.join(isXtc ? './xtc' : './pdfs', baseName);
-        if (!fs.existsSync(outputFolderPath)) {
-            fs.mkdirSync(outputFolderPath, { recursive: true });
-        }
+        if (!fs.existsSync(outputFolderPath)) fs.mkdirSync(outputFolderPath, { recursive: true });
         const outputPath = path.join(outputFolderPath, `${outputName}${outputExt}`);
 
-        // Skip if output file already exists
         if (fs.existsSync(outputPath)) {
-            console.log(`  Output already exists: ${outputPath}, skipping.`);
-            return true;
+            return { success: true, line: `${label} ${progressBar(1, 1)}  ✓  ${outputName} (cached)` };
         }
 
-        // Auto-generate title from URL if not explicitly set
         let chapterTitle = xtcOptions.title;
         if (!chapterTitle) {
             const urlMatch = url.match(/\/([^/]+)\/?$/);
-            if (urlMatch) {
-                chapterTitle = urlMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-            } else {
-                chapterTitle = `${baseName} ${formattedSeq}`;
-            }
+            chapterTitle = urlMatch ? urlMatch[1].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : `${baseName} ${formattedSeq}`;
         }
 
         if (isXtc) {
-            await convertImagesToXtc(imagesFolderPath, outputPath, {
-                ...xtcOptions,
-                title: chapterTitle
-            });
+            const result = await convertImagesToXtc(imagesFolderPath, outputPath, { ...xtcOptions, title: chapterTitle });
+            if (shouldClean) rimraf.sync(imagesFolderPath);
+            return { success: true, line: `${label} ${progressBar(1, 1)}  ✓  ${outputName}  ${result.pages}pp  ${result.sizeKb.toFixed(1)}KB` };
         } else {
             await convertImagesToPdf(imagesFolderPath, outputPath);
-            console.log(`Images converted to PDF: ${outputPath}`);
+            if (shouldClean) rimraf.sync(imagesFolderPath);
+            return { success: true, line: `${label} ${progressBar(1, 1)}  ✓  ${outputName}` };
         }
-
-        if (shouldClean) {
-            rimraf.sync(imagesFolderPath);
-            console.log('Images folder removed.');
-        }
-
-        return true;
     }
 
     /**
@@ -672,14 +593,14 @@ Paged mode (one URL = one image):
         if (noCache && fs.existsSync(imagesFolderPath)) rimraf.sync(imagesFolderPath);
         if (!fs.existsSync(imagesFolderPath)) fs.mkdirSync(imagesFolderPath, { recursive: true });
 
-        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser, {
+        const dlResult = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser, {
             waitUntil: 'load',
             navTimeout: 30000,
             skipScroll: true,
             skipCdp: true,
             blockResources: true
         });
-        if (!ok) return null;
+        if (!dlResult.success) return null;
 
         const imageFiles = fs.readdirSync(imagesFolderPath)
             .filter(f => /\.(jpe?g|png|webp|bmp|gif|tiff?)$/i.test(f))
@@ -832,12 +753,13 @@ Paged mode (one URL = one image):
             const suffix = chunks.length > 1 ? `-${String(c + 1).padStart(suffixWidth, '0')}` : '';
             const outputPath = path.join(outputFolderPath, `${baseName}${suffix}.xtc`);
 
-            console.log(`\n[${c + 1}/${chunks.length}] ${outputPath} (${chunks[c].length} pages)`);
+            console.log(`\n[${c + 1}/${chunks.length}] encoding ${chunks[c].length} pages...`);
 
-            await convertImagePathsToXtc(chunks[c], outputPath, {
+            const result = await convertImagePathsToXtc(chunks[c], outputPath, {
                 ...xtcOptions,
                 title: xtcOptions.title || baseName
             });
+            console.log(`  ${progressBar(chunks[c].length, chunks[c].length)}  ✓ ${path.basename(outputPath)}  ${result.pages} pages  ${result.sizeKb.toFixed(1)} KB`);
 
             if (shouldClean) {
                 for (const imgPath of chunks[c]) rimraf.sync(path.dirname(imgPath));
@@ -863,79 +785,109 @@ Paged mode (one URL = one image):
      */
     async function tryWithRetries(index) {
         const seq = formatSequenceNumber(index + 1, urls.length);
+        const label = `[${seq}/${urls.length}]`;
+        const logs = [];
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const success = await processChapter(index);
-                if (success) return true;
+                const result = await processChapter(index);
+                if (result.success) return { success: true, line: result.line, logs };
             } catch (err) {
-                console.error(`  [${seq}] ERROR: ${err.message}`);
+                logs.push(`  ${label} error: ${err.message}`);
             }
-
             if (attempt < MAX_RETRIES) {
-                console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
-            } else {
-                console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts.`);
+                logs.push(`  ${label} retrying (${attempt}/${MAX_RETRIES})...`);
             }
         }
 
-        return false;
+        return {
+            success: false,
+            line: `${label} ✗  failed after ${MAX_RETRIES} attempts`,
+            logs
+        };
     }
 
-    /**
-     * Go through the entire failed queue, giving each item 3 tries.
-     * Items that succeed are removed. Items that fail stay in the queue.
-     */
+    async function runBatch(indices) {
+        const seqs = indices.map(j => formatSequenceNumber(j + 1, urls.length));
+        const resultLines = new Array(indices.length).fill(null);
+        let animFrame = 0;
+
+        const getLines = () => indices.map((_, k) =>
+            resultLines[k] ?? `[${seqs[k]}/${urls.length}] ${DOT_FRAMES[animFrame]}`
+        );
+
+        for (const seq of seqs) {
+            process.stdout.write(`[${seq}/${urls.length}] ${DOT_FRAMES[0]}\n`);
+        }
+
+        const animTimer = setInterval(() => {
+            animFrame = (animFrame + 1) % DOT_FRAMES.length;
+            redrawLines(getLines());
+        }, 250);
+
+        const batchLogs = [];
+
+        await Promise.all(indices.map((index, k) =>
+            tryWithRetries(index).then(({ success, line, logs }) => {
+                resultLines[k] = line;
+                if (!success) batchLogs.push(...logs);
+                if (success) completed++;
+                else failedQueue.push(index);
+                redrawLines(getLines());
+            })
+        ));
+
+        clearInterval(animTimer);
+        redrawLines(getLines());
+        for (const log of batchLogs) console.log(log);
+    }
+
     async function drainFailedQueue() {
         if (failedQueue.length === 0) return;
-
-        console.log(`\n  >> Processing failed queue (${failedQueue.length} chapters)...`);
+        console.log(`\n  >> retrying ${failedQueue.length} failed chapter(s)...`);
         const stillFailed = [];
 
         for (const index of failedQueue) {
             const seq = formatSequenceNumber(index + 1, urls.length);
-            console.log(`\n  >> Retrying chapter ${seq} from failed queue`);
+            process.stdout.write(`[${seq}/${urls.length}] ${DOT_FRAMES[0]}\n`);
+            let animFrame = 0;
+            const animTimer = setInterval(() => {
+                animFrame = (animFrame + 1) % DOT_FRAMES.length;
+                redrawLines([`[${seq}/${urls.length}] ${DOT_FRAMES[animFrame]}`]);
+            }, 250);
 
-            const success = await tryWithRetries(index);
-            if (success) {
-                completed++;
-                console.log(`  >> Chapter ${seq} recovered!`);
-            } else {
-                stillFailed.push(index);
-                console.log(`  >> Chapter ${seq} still failing, stays in queue.`);
-            }
+            const { success, line, logs } = await tryWithRetries(index);
+            clearInterval(animTimer);
+            redrawLines([line]);
+            if (!success) for (const log of logs) console.log(log);
+
+            if (success) completed++;
+            else stillFailed.push(index);
         }
 
-        // Replace the queue with whatever's still failing
         failedQueue.length = 0;
         failedQueue.push(...stillFailed);
-
-        if (failedQueue.length > 0) {
-            console.log(`\n  >> ${failedQueue.length} chapters still in failed queue.`);
-        } else {
-            console.log(`\n  >> Failed queue cleared!`);
-        }
+        console.log(failedQueue.length > 0
+            ? `  >> ${failedQueue.length} chapter(s) still failing`
+            : `  >> failed queue cleared`);
     }
 
     // Main loop
-    for (let i = 0; i < urls.length; i++) {
-        const success = await tryWithRetries(i);
+    const CONCURRENCY = parseInt(process.env.CONCURRENCY || '2', 10);
 
-        if (success) {
-            completed++;
-            // After a success, sweep through the entire failed queue
-            await drainFailedQueue();
-        } else {
-            const seq = formatSequenceNumber(i + 1, urls.length);
-            failedQueue.push(i);
-            console.log(`  Queued chapter ${seq} for later (${failedQueue.length} in failed queue)`);
+    for (let i = 0; i < urls.length; i += CONCURRENCY) {
+        const batchIndices = [];
+        for (let j = i; j < Math.min(i + CONCURRENCY, urls.length); j++) {
+            batchIndices.push(j);
         }
+        await runBatch(batchIndices);
+        await drainFailedQueue();
     }
 
     // Final drain after all new chapters are done
     if (failedQueue.length > 0) {
         console.log(`\n========================================`);
-        console.log(`All new chapters done. Final retry of ${failedQueue.length} failed chapters...`);
+        console.log(`Final retry of ${failedQueue.length} failed chapters...`);
         await drainFailedQueue();
     }
 
