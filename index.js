@@ -99,7 +99,9 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
  *   2. Fallback: capture images via CDP network interception during page load
  *      (works when CDN blocks fetch/canvas/direct navigation)
  */
-async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, sharedBrowser = null) {
+async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, sharedBrowser = null, pageOptions = {}) {
+    const waitUntil = pageOptions.waitUntil || 'networkidle2';
+    const navTimeout = pageOptions.navTimeout || 60000;
     const browser = sharedBrowser || await puppeteer.launch({
         headless: 'new',
         args: [
@@ -134,7 +136,7 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
     const MAX_NAV_ATTEMPTS = 10;
 
     for (let navAttempt = 1; navAttempt <= MAX_NAV_ATTEMPTS; navAttempt++) {
-        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+        await page.goto(url, { waitUntil, timeout: navTimeout });
 
         const currentHostname = (() => { try { return new URL(page.url()).hostname; } catch { return ''; } })();
 
@@ -631,7 +633,10 @@ Paged mode (one URL = one image):
         if (noCache && fs.existsSync(imagesFolderPath)) rimraf.sync(imagesFolderPath);
         if (!fs.existsSync(imagesFolderPath)) fs.mkdirSync(imagesFolderPath, { recursive: true });
 
-        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser);
+        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser, {
+            waitUntil: 'load',
+            navTimeout: 30000
+        });
         if (!ok) return null;
 
         const imageFiles = fs.readdirSync(imagesFolderPath)
@@ -685,6 +690,16 @@ Paged mode (one URL = one image):
         const failedCount = urls.length - successPaths.length;
         console.log(`\nDownloaded ${successPaths.length}/${urls.length} pages${failedCount > 0 ? ` (${failedCount} failed)` : ''}.`);
 
+        if (failedCount > 0) {
+            const missingPages = allImagePaths
+                .map((p, i) => p ? null : i + 1)
+                .filter(Boolean);
+            console.error(`\nFAILED: ${failedCount} page(s) could not be downloaded. No XTC files will be created.`);
+            console.error(`  Missing pages: ${missingPages.join(', ')}`);
+            console.error(`  Re-run the same command to retry — already-cached pages will be skipped.`);
+            return;
+        }
+
         if (successPaths.length === 0) {
             console.error('No pages downloaded, nothing to convert.');
             return;
@@ -700,6 +715,13 @@ Paged mode (one URL = one image):
         const outputFolderPath = path.join('./xtc', baseName);
         if (!fs.existsSync(outputFolderPath)) fs.mkdirSync(outputFolderPath, { recursive: true });
 
+        // Clear existing XTC files before writing fresh ones
+        const existingXtc = fs.readdirSync(outputFolderPath).filter(f => f.endsWith('.xtc'));
+        if (existingXtc.length > 0) {
+            console.log(`\nClearing ${existingXtc.length} existing XTC file(s) from ${outputFolderPath}...`);
+            for (const f of existingXtc) fs.unlinkSync(path.join(outputFolderPath, f));
+        }
+
         const suffixWidth = Math.max(chunks.length.toString().length, 2);
         console.log(`\nConverting into ${chunks.length} XTC file(s) (limit: ${effectiveLimit} pages each)...`);
 
@@ -708,11 +730,6 @@ Paged mode (one URL = one image):
             const outputPath = path.join(outputFolderPath, `${baseName}${suffix}.xtc`);
 
             console.log(`\n[${c + 1}/${chunks.length}] ${outputPath} (${chunks[c].length} pages)`);
-
-            if (fs.existsSync(outputPath)) {
-                console.log(`  Already exists, skipping.`);
-                continue;
-            }
 
             await convertImagePathsToXtc(chunks[c], outputPath, {
                 ...xtcOptions,
@@ -726,7 +743,6 @@ Paged mode (one URL = one image):
 
         console.log(`\n========================================`);
         console.log(`Done! ${chunks.length} XTC file(s) in ./xtc/${baseName}/`);
-        if (failedCount > 0) console.log(`${failedCount} pages failed to download — re-run to retry (cached pages skipped).`);
     }
 
     if (isPagedMode) {
