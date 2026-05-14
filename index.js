@@ -99,8 +99,8 @@ async function downloadImageViaBrowser(page, imageUrl, savePath) {
  *   2. Fallback: capture images via CDP network interception during page load
  *      (works when CDN blocks fetch/canvas/direct navigation)
  */
-async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors) {
-    const browser = await puppeteer.launch({
+async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, sharedBrowser = null) {
+    const browser = sharedBrowser || await puppeteer.launch({
         headless: 'new',
         args: [
             '--disable-blink-features=AutomationControlled',
@@ -262,7 +262,8 @@ async function downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, er
     console.log(`  Downloaded ${downloadedCount}/${imageUrls.length} images`);
 
     await client.detach().catch(() => {});
-    await browser.close();
+    await page.close();
+    if (!sharedBrowser) await browser.close();
 
     // Save cache metadata
     if (!failed) {
@@ -610,7 +611,7 @@ Paged mode (one URL = one image):
      * Paged mode: each URL contains a single image.
      * Downloads all pages in order, then splits into IMG_LIMIT-sized XTC files.
      */
-    async function getPagedImagePath(url) {
+    async function getPagedImagePath(url, browser) {
         const urlHash = crypto.createHash('md5').update(url).digest('hex').slice(0, 12);
         const imagesFolderPath = path.join(cacheDir, urlHash);
         const metaPath = path.join(imagesFolderPath, '.meta.json');
@@ -630,7 +631,7 @@ Paged mode (one URL = one image):
         if (noCache && fs.existsSync(imagesFolderPath)) rimraf.sync(imagesFolderPath);
         if (!fs.existsSync(imagesFolderPath)) fs.mkdirSync(imagesFolderPath, { recursive: true });
 
-        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors);
+        const ok = await downloadFromPage(url, cssSelector, imagesFolderPath, metaPath, errors, browser);
         if (!ok) return null;
 
         const imageFiles = fs.readdirSync(imagesFolderPath)
@@ -647,25 +648,37 @@ Paged mode (one URL = one image):
         const imgLimit = parseInt(process.env.IMG_LIMIT || '100', 10);
         const allImagePaths = new Array(urls.length).fill(null);
 
-        // Download phase
-        for (let i = 0; i < urls.length; i++) {
-            const url = urls[i];
-            const seq = formatSequenceNumber(i + 1, urls.length);
-            console.log(`\n[${seq}/${urls.length}] Fetching: ${url}`);
+        const browser = await puppeteer.launch({
+            headless: 'new',
+            args: ['--disable-blink-features=AutomationControlled', '--no-sandbox']
+        });
 
-            for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                try {
-                    const imgPath = await getPagedImagePath(url);
-                    if (imgPath) { allImagePaths[i] = imgPath; break; }
-                } catch (err) {
-                    console.error(`  [${seq}] ERROR: ${err.message}`);
+        // Download phase — reuse one browser across all pages
+        try {
+            for (let i = 0; i < urls.length; i++) {
+                const url = urls[i];
+                const seq = formatSequenceNumber(i + 1, urls.length);
+                console.log(`\n[${seq}/${urls.length}] Fetching: ${url}`);
+
+                for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    try {
+                        const imgPath = await getPagedImagePath(url, browser);
+                        if (imgPath) { allImagePaths[i] = imgPath; break; }
+                    } catch (err) {
+                        console.error(`  [${seq}] ERROR: ${err.message}`);
+                    }
+                    if (attempt < MAX_RETRIES) {
+                        console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
+                    } else {
+                        console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts, skipping.`);
+                    }
                 }
-                if (attempt < MAX_RETRIES) {
-                    console.log(`  [${seq}] Attempt ${attempt}/${MAX_RETRIES} failed, retrying...`);
-                } else {
-                    console.log(`  [${seq}] Failed all ${MAX_RETRIES} attempts, skipping.`);
-                }
+
+                // Brief pause between pages to avoid overwhelming the system
+                await new Promise(r => setTimeout(r, 300));
             }
+        } finally {
+            await browser.close();
         }
 
         const successPaths = allImagePaths.filter(Boolean);
